@@ -27,4 +27,4 @@ RUN apk --no-cache --virtual .gyp add \
 
 COPY --from=build /opt/membership-server/public/dist /opt/membership-server/public/dist
 
-ENTRYPOINT ["npm", "run", "start"]
+CMD ["npm", "run", "start"]

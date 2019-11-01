@@ -14,7 +14,7 @@ Object.assign(config, {
     idle: 30000,
     acquire: 60000,
   },
-  logging: false,
+//  logging: true,
 });
 
 let sequelize;
@@ -23,6 +23,12 @@ if (config.use_env_variable) {
 } else {
   sequelize = new Sequelize(config.database, config.username, config.password, config);
 }
+
+sequelize
+  .authenticate()
+  .then(() => {
+    console.log('Connection has been established successfully.');
+  });
 
 fs
   .readdirSync(__dirname)

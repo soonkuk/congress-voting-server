@@ -2,11 +2,12 @@ const express = require('express');
 const createError = require('http-errors');
 const { hash, verify } = require('sebakjs-util');
 const debug = require('debug')('voting:routes:membership');
-
 const { Membership, Proposal } = require('../../models/index');
 const { underscored } = require('../utils');
 const {
+  getToken,
   getApplicantStatus,
+  // doApplicantRequest,
   getAccessToken,
   getApplicant,
   getApplicantByAddress,
@@ -16,6 +17,29 @@ const { currentHeight, getFrozenAccounts } = require('../../lib/sebak');
 const { SEBAK_NETWORKID = 'sebak-test-network' } = process.env;
 
 const router = express.Router();
+
+let bearerToken;
+let tokenCretedTime;
+
+// Days are converted to milliseconds
+// 24 hours * 60 minutes * 60 seconds *1000 milliseconds * 3 days = 259200000
+const tokenExpireDuration = 259200000;
+
+const isTokenExpired = () => {
+  const nowTime = Date.now();
+  if ((nowTime - tokenCretedTime) >= tokenExpireDuration) {
+    tokenCretedTime = Date.now();
+    return true;
+  }
+  return false;
+};
+
+const init = (async () => {
+  bearerToken = await getToken();
+  tokenCretedTime = Date.now();
+});
+
+init();
 
 // create new membership (signature required)
 router.post('/memberships', async (req, res, next) => {
@@ -65,6 +89,10 @@ router.post('/memberships', async (req, res, next) => {
 
 // callback to get verification result from Sub&Substance
 router.post('/memberships/sumsub/callback', async (req, res, next) => {
+  if (isTokenExpired()) {
+    bearerToken = await getToken();
+  }
+  const token = bearerToken;
   try {
     debug('POST /memberships/sumsub/callback %o', req.body);
     if (req.body.type === 'INSPECTION_REVIEW_COMPLETED') {
@@ -73,7 +101,7 @@ router.post('/memberships/sumsub/callback', async (req, res, next) => {
       if (!m) { return res.json({}); }
 
       if (!m.applicantId) {
-        const applicantData = await getApplicantByAddress(req.body.externalUserId);
+        const applicantData = await getApplicantByAddress(token, req.body.externalUserId);
         if (applicantData && applicantData.id) {
           await m.pend(applicantData.id);
         }
@@ -87,7 +115,7 @@ router.post('/memberships/sumsub/callback', async (req, res, next) => {
         await m.reject();
       }
     } else if (req.body.type === 'JOB_FINISHED') {
-      const applicantData = await getApplicant(req.body.applicantId);
+      const applicantData = await getApplicant(token, req.body.applicantId);
       if (applicantData && applicantData.externalUserId) {
         const m = await Membership.findByAddress(applicantData.externalUserId);
         if (!m) { return res.json({}); }
@@ -103,6 +131,9 @@ router.post('/memberships/sumsub/callback', async (req, res, next) => {
 
     return res.json({});
   } catch (err) {
+    if (err.statusCode === 401 && err.statusMessage === 'Unauthorized') {
+      bearerToken = await getToken();
+    }
     return next(err);
   }
 });
@@ -110,46 +141,70 @@ router.post('/memberships/sumsub/callback', async (req, res, next) => {
 // obtain access token from sum&sub
 router.get('/memberships/sumsub/access-token/:address', async (req, res, next) => {
   try {
-    debug('GET /memberships/sumsub/access-token/:address %s', req.params.address);
-    const token = await getAccessToken(req.params.address);
+    // const applicantRequstStatus = await doApplicantRequest(apiKey);
+    // if (applicantRequstStatus === false) {
+    //  throw new Error('Failed to applicantRequest');
+    // }
 
-    return res.json({ data: token });
+    debug('GET /memberships/sumsub/access-token/:address %s', req.params.address);
+    if (isTokenExpired()) {
+      bearerToken = await getToken();
+    }
+    const token = bearerToken;
+    const accessToken = await getAccessToken(token, req.params.address);
+    const body = { data: `${accessToken}` };
+    return res.json(body);
   } catch (err) {
+    if (err.statusCode === 401 && err.statusMessage === 'Unauthorized') {
+      bearerToken = await getToken();
+    }
     return next(err);
   }
 });
 
 // find an existing membership
 router.get('/memberships/:address', async (req, res, next) => {
+  if (isTokenExpired()) {
+    bearerToken = await getToken();
+  }
+  const token = bearerToken;
   try {
     debug('GET /memberships/:address %s', req.params.address);
     const m = await Membership.findByAddress(req.params.address);
     if (!m) { return next(createError(404, 'The address does not exist.')); }
-
+    const tempResult = await getApplicantStatus(token, m.applicantId);
+    console.log("temp result :", tempResult);
     const now = new Date();
     // SUMSUB_RENEW_INTERVAL is msec
     now.setMilliseconds(now.getMilliseconds() - (process.env.SUMSUB_RENEW_INTERVAL || 1));
-
     if (
       (m.status === Membership.Status.init.name || m.status === Membership.Status.pending.name)
        && m.updatedAt < now
     ) {
       if (!m.applicantId) {
-        const applicantData = await getApplicantByAddress(m.publicAddress);
+        const applicantData = await getApplicantByAddress(token, m.publicAddress);
         if (applicantData && applicantData.id) {
           await m.pend(applicantData.id);
+          const result = await getApplicantStatus(token, m.applicantId);
+          if (result === 'verified') { await m.verify(); }
+          if (result === 'rejected') { await m.reject(); }
+          if (result === 'pending') { await m.pend(); }
+          await m.reload();
         }
+      } else if (m.applicantId) {
+        const result = await getApplicantStatus(token, m.applicantId);
+        if (result === 'verified') { await m.verify(); }
+        if (result === 'rejected') { await m.reject(); }
+        if (result === 'pending') { await m.pend(); }
+        await m.reload();
       }
-
-      const result = await getApplicantStatus(m.applicantId);
-      if (result === 'verified') { await m.verify(); }
-      if (result === 'rejected') { await m.reject(); }
-      if (result === 'pending') { await m.pend(); }
-      await m.reload();
     }
 
     return res.json(underscored(m.toJSON()));
   } catch (err) {
+    if (err.statusCode === 401 && err.statusMessage === 'Unauthorized') {
+      bearerToken = await getToken();
+    }
     return next(err);
   }
 });
@@ -192,7 +247,12 @@ router.put('/memberships/:address', async (req, res, next) => {
       return res.json(underscored(m.toJSON()));
     }
 
-    const result = await getApplicantStatus(applicantId);
+    if (isTokenExpired()) {
+      bearerToken = await getToken();
+    }
+    const token = bearerToken;
+    const result = await getApplicantStatus(token, applicantId);
+
     if (m.status === Membership.Status.init.name) {
       if (result === 'init') {
         m.init(applicantId);
@@ -205,6 +265,9 @@ router.put('/memberships/:address', async (req, res, next) => {
 
     return res.json(underscored(m.toJSON()));
   } catch (err) {
+    if (err.statusCode === 401 && err.statusMessage === 'Unauthorized') {
+      bearerToken = await getToken();
+    }
     return next(err);
   }
 });
@@ -248,7 +311,6 @@ router.post('/memberships/:address/activate', async (req, res, next) => {
     debug('POST /memberships/:address/activate %s %o', req.params.address, req.body);
     const m = await Membership.findByAddress(req.params.address);
     if (!m) { return next(createError(404, 'The address does not exist.')); }
-
     // check frozen accounts in sebak
     const accounts = await getFrozenAccounts(req.params.address);
     const hasFrozen = accounts && accounts._embedded // eslint-disable-line no-underscore-dangle
@@ -257,7 +319,6 @@ router.post('/memberships/:address/activate', async (req, res, next) => {
     if (!hasFrozen) {
       return next(createError(400, 'There is no frozen account'));
     }
-
     const height = await currentHeight();
     await m.activate(height, req.body.signature);
 
